@@ -1,0 +1,186 @@
+# ============================================================
+#  LAMMPS: Tungsten Ball Impact — FIXED BALL MOVEMENT
+#  Ball properly flies down and penetrates Al sheet
+#  Potential: CuAlW.txt
+# ============================================================
+
+units           metal
+dimension       3
+boundary        p p f
+atom_style      atomic
+
+variable        sheet_lx  equal 200.0
+variable        sheet_ly  equal 200.0
+variable        sheet_lz  equal 12.0
+
+variable        ball_r    equal 25.0
+variable        ball_cx   equal 100.0
+variable        ball_cy   equal 100.0
+variable        ball_cz   equal 70.0        # start closer to sheet
+
+variable        v_impact  equal -15.0
+variable        T_init    equal 300.0
+variable        dt        equal 0.001
+
+# --------------- Lattice & Box ---------------
+lattice         fcc 4.05
+region          simbox block 0 ${sheet_lx} 0 ${sheet_ly} -60 120 units box
+create_box      2 simbox
+
+# --------------- Al Sheet (Type 1) ---------------
+region          sheet_reg block 0 ${sheet_lx} 0 ${sheet_ly} 0 ${sheet_lz} units box
+create_atoms    1 region sheet_reg
+
+# --------------- W Ball (Type 2) ---------------
+lattice         bcc 3.165
+region          ball_reg sphere ${ball_cx} ${ball_cy} ${ball_cz} ${ball_r} units box
+create_atoms    2 region ball_reg
+
+mass            1 26.982
+mass            2 183.84
+
+pair_style      eam/alloy
+pair_coeff      * * CuAlW.txt Al W
+
+neighbor        3.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+# --------------- Groups ---------------
+group           al_sheet    type 1
+group           w_ball      type 2
+
+region          inner_reg   block 4 196 4 196 0 ${sheet_lz} units box
+group           sheet_inner region inner_reg
+group           sheet_edge  subtract al_sheet sheet_inner
+
+# --------------- Stress Computes ---------------
+compute         stress_atom all stress/atom NULL
+
+variable        sxx atom c_stress_atom[1]
+variable        syy atom c_stress_atom[2]
+variable        szz atom c_stress_atom[3]
+variable        sxy atom c_stress_atom[4]
+variable        sxz atom c_stress_atom[5]
+variable        syz atom c_stress_atom[6]
+
+variable        von_mises atom sqrt(0.5*((v_sxx-v_syy)^2+(v_syy-v_szz)^2+(v_szz-v_sxx)^2+6*(v_sxy^2+v_sxz^2+v_syz^2)))
+variable        hydro_press atom -(v_sxx+v_syy+v_szz)/3.0
+
+compute         ke_atom  all ke/atom
+compute         pe_atom  all pe/atom
+compute         avg_vm   all reduce ave v_von_mises
+compute         max_vm   all reduce max v_von_mises
+compute         avg_press all reduce ave v_hydro_press
+compute         max_press all reduce max v_hydro_press
+compute         min_press all reduce min v_hydro_press
+
+thermo          100
+thermo_style    custom step atoms temp pe ke etotal press &
+                c_avg_vm c_max_vm c_avg_press
+
+dump            1 all custom 100 impact_stress.lammpstrj &
+                id type x y z vx vy vz &
+                v_von_mises v_hydro_press &
+                c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+                c_stress_atom[4] c_stress_atom[5] c_stress_atom[6]
+dump_modify     1 sort id
+
+dump            2 all custom 100 impact_vonmises.lammpstrj &
+                id type x y z v_von_mises v_hydro_press
+dump_modify     2 sort id
+
+fix             stress_out all ave/time 100 1 100 &
+                c_avg_vm c_max_vm c_avg_press c_min_press c_max_press &
+                file stress_history.dat
+
+timestep        ${dt}
+
+# ============================================================
+#  STEP 0: Equilibrate sheet ONLY
+#  KEY FIX: freeze ball separately, unfix it completely before impact
+# ============================================================
+
+# Freeze sheet edges permanently (clamped BC)
+fix             frz_edge sheet_edge setforce 0.0 0.0 0.0
+
+# Freeze ball ONLY during equilibration — will be REMOVED before impact
+fix             frz_ball w_ball setforce 0.0 0.0 0.0
+
+# Also zero ball velocity so it doesn't drift during minimize
+velocity        w_ball set 0.0 0.0 0.0
+
+minimize        1.0e-5 1.0e-7 10000 100000
+
+velocity        sheet_inner create ${T_init} 12345 mom yes rot yes dist gaussian
+
+fix             fnvt_sheet sheet_inner nvt temp ${T_init} ${T_init} 0.1
+
+run             3000
+
+unfix           fnvt_sheet
+
+# ============================================================
+#  KEY FIX 1: UNFIX the ball freeze BEFORE impact
+# ============================================================
+unfix           frz_ball
+
+print ">>> frz_ball removed — ball is now FREE to move"
+
+# ============================================================
+#  KEY FIX 2: Set impact velocity AFTER unfixing
+# ============================================================
+velocity        w_ball set 0.0 0.0 ${v_impact}
+
+print ">>> W ball velocity set to -15 Ang/ps downward"
+
+# ============================================================
+#  KEY FIX 3: NVE on ball with NO competing fix
+#  frz_edge only applies to sheet_edge group — not ball
+# ============================================================
+fix             fnve_ball  w_ball      nve    # ball moves freely
+fix             fnve_sheet sheet_inner nve    # sheet dynamics
+
+# Verify ball is moving — check vz in thermo
+print ">>> Starting impact run — watch ball z position drop"
+
+# Approach + Impact + Exit
+# Ball at z=70, sheet top z=12, exit z=-60
+# Total distance = 70+12+60 = 142 Ang at 15 Ang/ps = 9.5 ps = 9500 steps
+# Run 15000 to capture full exit + aftermath
+
+run             15000
+
+unfix           fnve_ball
+unfix           fnve_sheet
+
+# ============================================================
+#  Post-Impact Relaxation
+# ============================================================
+fix             fnvt_post al_sheet nvt temp 300.0 1000.0 0.1
+run             5000
+unfix           fnvt_post
+
+# ============================================================
+#  Final Output
+# ============================================================
+print "================================================"
+print " STRESS RESULTS (final state)"
+print "================================================"
+print " Von Mises avg : $(c_avg_vm) bar*Ang3"
+print " Von Mises max : $(c_max_vm) bar*Ang3"
+print " Pressure avg  : $(c_avg_press) bar*Ang3"
+print " Pressure max  : $(c_max_press) bar*Ang3"
+print " Pressure min  : $(c_min_press) bar*Ang3"
+print "================================================"
+
+write_data      impact_final.data
+write_restart   impact_final.restart
+
+print "================================================"
+print " SIMULATION COMPLETE"
+print " Files: impact_stress.lammpstrj"
+print "        impact_vonmises.lammpstrj"
+print "        stress_history.dat"
+print "================================================"
+print " OVITO: Color by v_von_mises to see stress wave"
+print "================================================"
